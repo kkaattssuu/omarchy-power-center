@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "osean.power-center",
+  "name": "Power Center",
+  "version": "1.1.0",
+  "author": "Osean Sterling (@kkaattssuu)",
+  "description": "Power Center for ThinkPad T14 Gen 1 with AMD Ryzen 7 PRO 4750U only. May not work on your device.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "EcoService.qml"
+  },
+  "barWidget": {
+    "displayName": "Power Center",
+    "description": "Power Center for ThinkPad T14 Gen 1 with AMD Ryzen 7 PRO 4750U only. May not work on your device.",
+    "category": "System",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.power"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/kkaattssuu/omarchy-power-center"
+}

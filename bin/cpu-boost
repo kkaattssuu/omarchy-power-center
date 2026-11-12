@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+osean-cpu-boost — raise the AMD SMU package power limits above what the
+firmware's performance profile allows.
+
+Installed copy:  /usr/local/bin/osean-cpu-boost   (root:root, 0755)
+Plugin source:   ~/.config/omarchy/plugins/osean.power-center/bin/cpu-boost
+
+Only that installed path may appear in the sudoers drop-in. Never point
+sudoers at the plugin copy — it lives in a user-writable directory.
+
+Usage:
+  osean-cpu-boost status   -> JSON state
+  osean-cpu-boost on       -> raise limits (performance profile only)
+  osean-cpu-boost off      -> restore the limits found when 'on' ran
+"""
+import json
+import fcntl
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+RYZENADJ = "/usr/bin/ryzenadj"
+STATE = Path("/run/osean-cpu-boost.json")
+SMU = Path("/sys/kernel/ryzen_smu_drv/pm_table")
+
+# Target limits while boosted. Tune here.
+BOOST_SLOW = 30000  # mW, sustained average
+BOOST_FAST = 32000  # mW, short burst
+LEVELS = {"boost": (BOOST_SLOW, BOOST_FAST), "ai": (40000, 42000)}
+
+
+def saved_level():
+    try:
+        return json.loads(STATE.read_text()).get("level", "boost")
+    except Exception:
+        return "boost"
+
+ROW = re.compile(r"\|\s*(PPT LIMIT FAST|PPT LIMIT SLOW)\s*\|\s*([0-9.]+)\s*\|")
+
+
+def emit(payload):
+    print(json.dumps(payload))
+    return 0
+
+
+def read_limits():
+    """Return (slow_mw, fast_mw) read from the SMU table, or (None, None)."""
+    try:
+        out = subprocess.run([RYZENADJ, "-i"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None, None
+    if out.returncode != 0:
+        return None, None
+    slow = fast = None
+    for name, value in ROW.findall(out.stdout):
+        mw = int(round(float(value) * 1000))
+        if name == "PPT LIMIT FAST":
+            fast = mw
+        else:
+            slow = mw
+    return slow, fast
+
+
+def profile():
+    try:
+        out = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def performance_degraded():
+    """Return the daemon's restriction reason, or None if it cannot be read."""
+    try:
+        result = subprocess.run(["/usr/bin/busctl", "get-property", "net.hadess.PowerProfiles",
+                                 "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles",
+                                 "PerformanceDegraded"], capture_output=True, text=True, timeout=5)
+        match = re.fullmatch(r's "([a-z0-9-]*)"\s*', result.stdout)
+        return match.group(1) if result.returncode == 0 and match else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def available():
+    return SMU.exists() and os.path.exists(RYZENADJ) and os.access(RYZENADJ, os.X_OK)
+
+
+def on_ac():
+    return any(p.read_text().strip() == "1" for p in Path("/sys/class/power_supply").glob("*/online"))
+
+
+def restore_limits():
+    """Put back whatever limits were in place before 'on'. Returns True if it did."""
+    if not STATE.exists():
+        return False
+    if performance_degraded() not in ("", "lap-detected"):
+        # Do not write through an active or unreadable safety restriction.
+        STATE.unlink(missing_ok=True)
+        return True
+    try:
+        saved = json.loads(STATE.read_text())
+        slow, fast = int(saved["slow"]), int(saved["fast"])
+    except Exception:
+        slow, fast = 23000, 25000
+    # A different profile owns its own limits; never overwrite those with
+    # the saved performance limits after an external profile switch.
+    current = read_limits()
+    if performance_degraded() == "lap-detected":
+        if None in current:
+            raise RuntimeError("Could not read power limits")
+        slow, fast = min(slow, current[0]), min(fast, current[1])
+    if profile() == "performance" or current in LEVELS.values():
+        ok, _ = apply(slow, fast)
+        if not ok or read_limits() != (slow, fast):
+            raise RuntimeError("Could not restore power limits")
+    STATE.unlink(missing_ok=True)
+    return True
+
+
+def status(reason=""):
+    # Self-heal: the boost only belongs on the performance profile, and a
+    # profile switch (or unplugging) means the firmware has moved on without
+    # us. Restore rather than leave a raised limit behind a closed panel.
+    degraded = performance_degraded()
+    if STATE.exists() and degraded and degraded != "lap-detected":
+        # Firmware is protecting the machine; never restore higher saved
+        # limits over it. Forget boost without writing anything to the SMU.
+        STATE.unlink(missing_ok=True)
+        reason = reason or "performance-degraded"
+    elif STATE.exists() and (profile() != "performance" or not on_ac()):
+        restore_limits()
+        reason = reason or "profile-changed"
+
+    slow, fast = read_limits() if available() else (None, None)
+    level = saved_level() if STATE.exists() else ""
+    if STATE.exists() and slow is not None and (slow, fast) != LEVELS.get(level):
+        STATE.unlink(missing_ok=True)
+        level = ""
+    enhanced = STATE.exists()
+    return emit({
+        "available": available(),
+        "enhanced": enhanced,
+        "level": level if enhanced else "",
+        "profile": profile(),
+        "slow": slow,
+        "fast": fast,
+        "boost_slow": BOOST_SLOW,
+        "boost_fast": BOOST_FAST,
+        "reason": reason,
+        "degraded": degraded,
+    })
+
+
+def apply(slow, fast):
+    result = subprocess.run(
+        [RYZENADJ, f"--slow-limit={slow}", f"--fast-limit={fast}"],
+        capture_output=True, text=True, timeout=15)
+    return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def cmd_on(level="boost"):
+    if not on_ac():
+        status("requires-ac")
+        return 1
+    if not available():
+        status("smu-unavailable")
+        return 1
+    if profile() != "performance":
+        status("requires-performance")
+        return 1
+    if performance_degraded() not in ("", "lap-detected"):
+        status("performance-degraded-or-unknown")
+        return 1
+    if level not in LEVELS:
+        return 1
+    target = LEVELS[level]
+    if STATE.exists():
+        if saved_level() == level:
+            return status("already-on")
+        restore_limits()
+
+    slow, fast = read_limits()
+    if slow is None or fast is None:
+        status("cannot-read-limits")
+        return 1
+
+    STATE.write_text(json.dumps({"slow": slow, "fast": fast, "level": level}))
+
+    ok, detail = apply(*target)
+    if not ok:
+        restore_limits()
+        status(f"apply-failed: {detail}")
+        return 1
+
+    new_slow, new_fast = read_limits()
+    if (new_slow, new_fast) != target:
+        restore_limits()
+        status("firmware-refused")
+        return 1
+
+    return status("boosted")
+
+
+def cmd_off():
+    if restore_limits():
+        return status("restored")
+    return status("already-off")
+
+
+def main():
+    if os.geteuid() != 0:
+        return emit({"error": "must run as root"})
+
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action == "status":
+        return status()
+    if action == "on":
+        return cmd_on()
+    if action == "ai":
+        return cmd_on("ai")
+    if action == "off":
+        return cmd_off()
+    return emit({"error": f"unknown action: {action}"})
+
+
+if __name__ == "__main__":
+    with open("/run/osean-cpu-boost.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            sys.exit(main())
+        except Exception as error:
+            emit({"error": str(error)})
+            sys.exit(1)
