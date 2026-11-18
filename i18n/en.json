@@ -1,4 +1,5 @@
 {
+  "power.voltage": "Voltage",
   "profile.eco": "Eco",
   "profile.saver": "Saver",
   "profile.eco.tooltip": "Toggle Eco mode",

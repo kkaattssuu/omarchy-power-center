@@ -226,6 +226,16 @@ Panel {
     return Model.batteryFraction(d)
   }
 
+  // UPower and omarchy-battery-status report power but not voltage, so the
+  // panel reads the pack straight from sysfs (microvolts, as the kernel
+  // exposes it). The battery name shown by UPower picks the right pack.
+  property real batteryVolts: 0
+  readonly property string voltagePath: {
+    var d = UPower.displayDevice
+    var name = d && d.nativePath ? String(d.nativePath) : "BAT0"
+    return "/sys/class/power_supply/" + name + "/voltage_now"
+  }
+
   readonly property bool charging: {
     var d = UPower.displayDevice
     return d && d.isPresent && !UPower.onBattery && !root.batteryFlowIdle
@@ -287,6 +297,7 @@ Panel {
     if (!batteryPresent) return
 
     if (!batteryProc.running) batteryProc.running = true
+    voltageFile.reload()
     if (!profilesProc.running) profilesProc.running = true
     if (!systemProc.running) systemProc.running = true
     if (!ecoProc.running) ecoProc.running = true
@@ -368,6 +379,17 @@ Panel {
     id: batteryProc
     command: ["omarchy-battery-status", "--shell"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateKeyValue(text, "battery") }
+  }
+
+  FileView {
+    id: voltageFile
+    path: root.voltagePath
+    printErrors: false
+    onLoaded: {
+      var micro = Number(String(text()).trim())
+      root.batteryVolts = isFinite(micro) && micro > 0 ? micro / 1e6 : 0
+    }
+    onLoadFailed: root.batteryVolts = 0
   }
 
   Process {
@@ -671,6 +693,10 @@ Panel {
             InfoPair {
               label: root.chargeThresholdActive ? Commons.I18n.t("power.batteryState") : (root.discharging ? Commons.I18n.t("power.discharging") : Commons.I18n.t("power.charging"))
               value: root.chargeThresholdActive ? Commons.I18n.t("power.holding") : (root.batteryFull ? "-" : root.reading(root.batteryInfo.rate))
+            }
+            InfoPair {
+              label: strings.t("power.voltage")
+              value: root.batteryVolts > 0 ? Commons.I18n.formatNumber(root.batteryVolts, 1) + "V" : "—"
             }
           }
         }
